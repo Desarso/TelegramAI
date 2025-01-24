@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,23 @@ type Assignment struct {
 	HTMLURL      string    `json:"html_url"`
 }
 
+type Course struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	CourseCode  string `json:"course_code"`
+	Enrollments []struct {
+		ComputedCurrentGrade       string  `json:"computed_current_grade"`
+		ComputedCurrentScore       float64 `json:"computed_current_score"`
+		ComputedCurrentLetterGrade string  `json:"computed_current_letter_grade"`
+		ComputedFinalGrade         string  `json:"computed_final_grade"`
+		ComputedFinalScore         float64 `json:"computed_final_score"`
+	} `json:"enrollments"`
+}
+
 var reminderTracker = make(map[int]map[time.Duration]bool)
+
+// keep track of scores here to detect changes
+var scoreTracker = make(map[int]float64)
 
 func main() {
 	if _, err := os.Stat(".env"); err == nil {
@@ -40,16 +57,19 @@ func main() {
 		log.Fatal("CANVAS_API_KEY not found in environment")
 	}
 
-	sendMessage(llm.Ell(createMessage)("Create a message letting the user know the server is working"))
+	sendMessage("Server Updated")
 
 	courseIDs, err := fetchCourseIDs(apiToken)
 	if err != nil {
 		log.Fatal("Error fetching course IDs:", err)
 	}
 
+	go startHourlyGradeReminderBot(apiToken)
+
 	// Start reminder bot for each course
 	for _, courseID := range courseIDs {
 		go startDailyReminderBot(apiToken, courseID)
+
 	}
 
 	// Keep main thread alive
@@ -83,9 +103,39 @@ func startDailyReminderBot(apiToken string, courseID int) {
 	}
 }
 
+func startHourlyGradeReminderBot(apiToken string) {
+	// Initialize global score tracker
+	globalScoreTracker := make(map[int]float64)
+
+	for {
+		// Fetch courses
+		courses, err := fetchCourses(apiToken)
+		if err != nil {
+			fmt.Printf("Error fetching courses: %v\n", err)
+			continue
+		}
+
+		// Check if ComputedCurrentScore has changed
+		for _, course := range courses {
+			for _, enrollment := range course.Enrollments {
+				if globalScoreTracker[course.ID] != enrollment.ComputedCurrentScore {
+					fmt.Printf("Course %d score has changed: %f -> %f\n", course.ID, globalScoreTracker[course.ID], enrollment.ComputedCurrentScore)
+					sendMessage("Score change detected for Course: " + course.CourseCode + ". New score: " + strconv.FormatFloat(enrollment.ComputedCurrentScore, 'f', 2, 64))
+					globalScoreTracker[course.ID] = enrollment.ComputedCurrentScore
+				}
+				//print the score anyways along with class name
+				fmt.Printf("Course %d: %s - Score: %f\n", course.ID, course.Name, enrollment.ComputedCurrentScore)
+			}
+		}
+
+		// Sleep for an hour
+		time.Sleep(time.Hour)
+	}
+}
+
 func fetchCourseIDs(apiToken string) ([]int, error) {
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", "https://canvas.instructure.com/api/v1/courses", nil)
+	req, err := http.NewRequest("GET", "https://canvas.instructure.com/api/v1/users/self/favorites/courses", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +176,37 @@ func fetchCourseIDs(apiToken string) ([]int, error) {
 	fmt.Println("course ids", courseIDs)
 
 	return courseIDs, nil
+}
+
+// fetch courses function
+func fetchCourses(apiToken string) ([]Course, error) {
+	client := &http.Client{}
+	courses := []Course{}
+
+	// Assuming courseIDs is a global variable or passed as a parameter
+	// If courseIDs is not defined, this function will not work as intended
+	// for i, courseID := range courseIDs {
+	req, err := http.NewRequest("GET", "https://canvas.instructure.com/api/v1/users/self/favorites/courses?include[]=total_scores", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch course: %s", resp.Status)
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&courses)
+	if err != nil {
+		return nil, err
+	}
+	return courses, nil
 }
 
 func fetchAssignments(apiToken string, courseID int) ([]Assignment, error) {
