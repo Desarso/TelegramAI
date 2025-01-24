@@ -1,0 +1,6 @@
+github.com/desarso/go_llm_functions v0.1.2 h1:YxAwmY3swc18KZOzOHhJY7uwMMIQBspov3e8DIlfuJQ=
+github.com/desarso/go_llm_functions v0.1.2/go.mod h1:fD05EfFzytVfqqY7zMDCDWIduIRFSRULoM6Wrv0phH4=
+github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
+github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
+google.golang.org/protobuf v1.36.3 h1:82DV7MYdb8anAVi3qge1wSnMDrnKK7ebr+I0hHRN1BU=
+google.golang.org/protobuf v1.36.3/go.mod h1:9fA7Ob0pmnwhb644+1+CVWFRbNajQ6iRojtC/QF5bRE=
