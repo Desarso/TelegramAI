@@ -40,6 +40,8 @@ func main() {
 		log.Fatal("CANVAS_API_KEY not found in environment")
 	}
 
+	sendMessage(llm.Ell(createMessage)("Create a message letting the user know the server is working"))
+
 	courseIDs, err := fetchCourseIDs(apiToken)
 	if err != nil {
 		log.Fatal("Error fetching course IDs:", err)
