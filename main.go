@@ -25,9 +25,11 @@ type Assignment struct {
 var reminderTracker = make(map[int]map[time.Duration]bool)
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	if _, err := os.Stat(".env"); err == nil {
+		err := godotenv.Load()
+		if err != nil {
+			log.Fatal("Error loading .env file")
+		}
 	}
 
 	llm.GROQ_API_KEY = os.Getenv("GROQ_API_KEY")
@@ -217,9 +219,11 @@ func sendNotification(assignment Assignment) {
 
 func sendMessage(message string) error {
 	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
-		return err
+	if _, err := os.Stat(".env"); err == nil {
+		err := godotenv.Load()
+		if err != nil {
+			log.Fatal("Error loading .env file")
+		}
 	}
 
 	// Retrieve environment variables
@@ -272,9 +276,11 @@ func sendMessage(message string) error {
 }
 
 func getAllChatIds() ([]string, error) {
-	if err := godotenv.Load(); err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
-		return nil, err
+	if _, err := os.Stat(".env"); err == nil {
+		err := godotenv.Load()
+		if err != nil {
+			log.Fatal("Error loading .env file")
+		}
 	}
 
 	// Retrieve environment variables
