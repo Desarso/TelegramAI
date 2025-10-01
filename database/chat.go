@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // ChatDB handles chat history storage in SQLite
@@ -22,7 +22,7 @@ type ChatMessage struct {
 
 // NewChatDB creates a new chat database connection
 func NewChatDB(dbPath string) (*ChatDB, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
