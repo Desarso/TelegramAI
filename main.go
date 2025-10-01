@@ -1,306 +1,458 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	llm "github.com/desarso/go_llm_functions/helpers"
+	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
+	openai "github.com/sashabaranov/go-openai"
+	"desarso/TelegramAI/database"
+	"desarso/TelegramAI/monitor"
+	"desarso/TelegramAI/tools"
 )
 
-type Assignment struct {
-	ID           int       `json:"id"`
-	Name         string    `json:"name"`
-	DueAt        time.Time `json:"due_at"`
-	HasSubmitted bool      `json:"has_submitted_submissions"`
-	HTMLURL      string    `json:"html_url"`
+// Agent state
+type Agent struct {
+	client       *openai.Client
+	tools        []tools.Tool
+	chatDB       *database.ChatDB
+	chatHistory  map[int64][]openai.ChatCompletionMessage
 }
 
-type Course struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	CourseCode  string `json:"course_code"`
-	Enrollments []struct {
-		ComputedCurrentGrade       string  `json:"computed_current_grade"`
-		ComputedCurrentScore       float64 `json:"computed_current_score"`
-		ComputedCurrentLetterGrade string  `json:"computed_current_letter_grade"`
-		ComputedFinalGrade         string  `json:"computed_final_grade"`
-		ComputedFinalScore         float64 `json:"computed_final_score"`
-	} `json:"enrollments"`
+// getCourseInformation fetches and formats course information for the system prompt
+func (a *Agent) getCourseInformation() string {
+	// Use the canvas_data tool to get courses
+	for _, tool := range a.tools {
+		if tool.GetName() == "canvas_data" {
+			// Execute the get_courses function
+			call := &tools.FunctionCall{
+				Name: "get_courses",
+				Args: make(map[string]interface{}),
+			}
+
+			result, err := tool.ExecuteFunction(call)
+			if err != nil {
+				log.Printf("Failed to get course information: %v", err)
+				return "COURSE INFORMATION: Unable to load course data at this time."
+			}
+
+			// Format the course information
+			courses, ok := result.([]interface{})
+			if !ok || len(courses) == 0 {
+				return "COURSE INFORMATION: No courses found or unable to parse course data."
+			}
+
+			var courseList []string
+			courseList = append(courseList, "COURSE INFORMATION:")
+			courseList = append(courseList, "Here are your current Canvas courses:")
+
+			for i, courseRaw := range courses {
+				course, ok := courseRaw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// Extract course information
+				courseIDRaw, hasID := course["id"]
+				courseCodeRaw, hasCode := course["course_code"]
+				courseNameRaw, hasName := course["name"]
+
+				if !hasID || !hasCode || !hasName {
+					continue
+				}
+
+				// Convert ID to int
+				var courseID int
+				if idFloat, ok := courseIDRaw.(float64); ok {
+					courseID = int(idFloat)
+				}
+
+				courseCode, _ := courseCodeRaw.(string)
+				courseName, _ := courseNameRaw.(string)
+
+				// Format: "CSC 139-04: CSC139 Operating System Principles - SECTION 04 (ID: 137456)"
+				courseStr := fmt.Sprintf("• %s: %s (ID: %d)", courseCode, courseName, courseID)
+				courseList = append(courseList, courseStr)
+
+				// Limit to first 10 courses to avoid overly long prompts
+				if i >= 9 {
+					courseList = append(courseList, "• ... and more courses")
+					break
+				}
+			}
+
+			return strings.Join(courseList, "\n")
+		}
+	}
+
+	return "COURSE INFORMATION: Unable to load course data at this time."
 }
 
-var reminderTracker = make(map[int]map[time.Duration]bool)
+// createSystemMessage creates the system message with current date/time and course information
+func (a *Agent) createSystemMessage() openai.ChatCompletionMessage {
+	// Get current time in user's timezone and UTC
+	now := time.Now()
+	// Sacramento, CA is in Pacific Time (America/Los_Angeles)
+	userLocation, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		// Fallback to UTC if timezone loading fails
+		userLocation = time.UTC
+	}
 
-// keep track of scores here to detect changes
-var scoreTracker = make(map[int]float64)
+	userTime := now.In(userLocation).Format("Monday, January 2, 2006 at 3:04 PM (Pacific Time)")
+	utcTime := now.UTC().Format("Monday, January 2, 2006 at 15:04 UTC")
+
+	// Fetch course information
+	courseInfo := a.getCourseInformation()
+
+	systemContent := fmt.Sprintf(`You are an AI assistant helping Gabriel Malek, a computer science student, with his Canvas LMS courses and assignments.
+
+Current date and time in Pacific Time (Sacramento, CA): %s
+Current date and time in UTC: %s
+
+%s
+
+When interpreting assignment due dates and times from Canvas API responses:
+- Use UTC times for accurate deadline calculations
+- Convert to Pacific Time only for display purposes
+- Always use UTC for time-based comparisons and calculations
+- Remember that Sacramento, CA follows Pacific Standard Time (PST) or Pacific Daylight Time (PDT)
+
+For displaying due dates to the user:
+- CRITICAL: Canvas API returns ALL times in UTC - you MUST convert them to PDT for display
+- If an assignment is due today, show "due in X hours" format (e.g., "due in 3 hours")
+- If an assignment is due tomorrow, show "due tomorrow at X:XX PM PDT"
+- If an assignment is due in the future, show "due on [Day] at X:XX PM PDT"
+- Always display times in PDT (Pacific Daylight Time) for user clarity
+- Never show UTC times to the user - convert everything to PDT for display
+
+TIME CONVERSION RULES:
+- Take the UTC time from Canvas API
+- Convert it to Pacific Time (America/Los_Angeles timezone)
+- Display the converted time with "PDT" label
+- Use the current UTC time provided to calculate "due in X hours" accurately
+
+You have access to Canvas API tools to help with:
+- Getting course information and grades
+- Retrieving assignments and due dates
+- Accessing announcements and course content
+- Making general Canvas API calls
+
+Always be helpful, accurate, and conversational. Use the available tools when users ask about Canvas-related information.`, userTime, utcTime, courseInfo)
+
+	return openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: systemContent,
+	}
+}
+
+// Initialize the OpenRouter agent
+func NewAgent(openRouterKey, canvasToken string) (*Agent, error) {
+	// For OpenRouter, use a custom base URL
+	config := openai.DefaultConfig(openRouterKey)
+	config.BaseURL = "https://openrouter.ai/api/v1" // Use OpenRouter
+
+	client := openai.NewClientWithConfig(config)
+
+	// Initialize tools
+	canvasAPITool := tools.NewCanvasAPITool(canvasToken)
+	canvasDataTool := tools.NewCanvasDataTool(canvasToken)
+
+	agentTools := []tools.Tool{canvasAPITool, canvasDataTool}
+
+	// Initialize database
+	chatDB, err := database.NewChatDB("chats.db")
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize chat database: %w", err)
+	}
+
+	return &Agent{
+		client:      client,
+		tools:       agentTools,
+		chatDB:      chatDB,
+		chatHistory: make(map[int64][]openai.ChatCompletionMessage),
+	}, nil
+}
+
+// Process a user message and return a response
+func (a *Agent) ProcessMessage(chatID int64, userMessage string) (string, error) {
+	ctx := context.Background()
+
+	// Get or create chat history for this chat ID
+	history, exists := a.chatHistory[chatID]
+	if !exists {
+		// Get chat history from database for new conversations
+		dbHistory, err := a.chatDB.GetChatHistory(chatID)
+		if err != nil {
+			return "", fmt.Errorf("failed to get chat history: %w", err)
+		}
+
+		// Convert database history to OpenAI format
+		history = []openai.ChatCompletionMessage{a.createSystemMessage()}
+		for _, msg := range dbHistory {
+			if msg.Role == "user" {
+				history = append(history, openai.ChatCompletionMessage{
+					Role:    openai.ChatMessageRoleUser,
+					Content: msg.Content,
+				})
+			} else if msg.Role == "assistant" {
+				history = append(history, openai.ChatCompletionMessage{
+					Role:    openai.ChatMessageRoleAssistant,
+					Content: msg.Content,
+				})
+			}
+		}
+
+		a.chatHistory[chatID] = history
+		log.Printf("Created new chat history for chat ID: %d", chatID)
+	} else {
+		log.Printf("Using existing chat history for chat ID: %d", chatID)
+	}
+
+	// Add the current user message to history
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userMessage,
+	}
+	a.chatHistory[chatID] = append(a.chatHistory[chatID], userMsg)
+
+	// Save user message to database
+	if err := a.chatDB.SaveMessage(chatID, "user", userMessage); err != nil {
+		log.Printf("Warning: failed to save user message to database: %v", err)
+	}
+
+	// Prepare tools for OpenAI format
+	var openaiTools []openai.Tool
+	for _, tool := range a.tools {
+		// Convert our tool declarations to OpenAI format
+		for _, decl := range tool.GetFunctionDeclarations() {
+			openaiTool := openai.Tool{
+				Type: "function",
+				Function: &openai.FunctionDefinition{
+					Name:        decl.Name,
+					Description: decl.Description,
+					Parameters:  decl.Parameters,
+				},
+			}
+			openaiTools = append(openaiTools, openaiTool)
+		}
+	}
+
+	// Create the request
+	req := openai.ChatCompletionRequest{
+		Model:    "x-ai/grok-4-fast", // Use Grok-4 Fast via OpenRouter
+		Messages: a.chatHistory[chatID],
+		Tools:    openaiTools,
+	}
+
+	// Send request to OpenAI
+	resp, err := a.client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		log.Printf("OpenAI API error: %v", err)
+		return "", fmt.Errorf("failed to get response from OpenAI: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response choices returned from OpenAI")
+	}
+
+	choice := resp.Choices[0]
+	message := choice.Message
+
+	// Check if the response contains tool calls
+	if len(message.ToolCalls) > 0 {
+		log.Printf("Tool calls received: %d", len(message.ToolCalls))
+
+		// Execute each tool call
+		for _, toolCall := range message.ToolCalls {
+			log.Printf("Executing tool call: %s", toolCall.Function.Name)
+
+			// Find the tool that can handle this function
+			var result interface{}
+			var toolErr error
+
+			for _, tool := range a.tools {
+				if tool.GetName() == "canvas_api" || tool.GetName() == "canvas_data" {
+					// Convert OpenAI function call to our generic FunctionCall format
+					call := &tools.FunctionCall{
+						Name: toolCall.Function.Name,
+						Args: make(map[string]interface{}),
+					}
+
+					// Parse arguments
+					if toolCall.Function.Arguments != "" {
+						if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &call.Args); err != nil {
+							log.Printf("Failed to parse tool call arguments: %v", err)
+							continue
+						}
+					}
+
+					result, toolErr = tool.ExecuteFunction(call)
+					if toolErr == nil {
+						log.Printf("Tool %s executed successfully", tool.GetName())
+						break
+					}
+				}
+			}
+
+			if toolErr != nil {
+				log.Printf("All tools failed for function %s: %v", toolCall.Function.Name, toolErr)
+				return "", toolErr
+			}
+
+			// Add tool result to conversation
+			toolResult := openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    fmt.Sprintf("%v", result),
+				ToolCallID: toolCall.ID,
+			}
+			a.chatHistory[chatID] = append(a.chatHistory[chatID], toolResult)
+
+			// Get another response that should contain the final answer
+			finalReq := openai.ChatCompletionRequest{
+				Model:    "x-ai/grok-4-fast",
+				Messages: a.chatHistory[chatID],
+				Tools:    openaiTools,
+			}
+
+			finalResp, err := a.client.CreateChatCompletion(ctx, finalReq)
+	if err != nil {
+				log.Printf("Failed to get final response: %v", err)
+				return "", err
+			}
+
+			if len(finalResp.Choices) > 0 {
+				finalMessage := finalResp.Choices[0].Message
+				response := finalMessage.Content
+
+				// Check if response is empty and handle gracefully
+				if strings.TrimSpace(response) == "" {
+					log.Println("Received empty response from AI after tool call, providing fallback message")
+					response = "I apologize, but I wasn't able to generate a response after processing the tool results. Please try asking your question again."
+
+					// Save fallback response to database
+					if err := a.chatDB.SaveMessage(chatID, "assistant", response); err != nil {
+						log.Printf("Warning: failed to save fallback assistant message to database: %v", err)
+					}
+
+					// Add to chat history
+					a.chatHistory[chatID] = append(a.chatHistory[chatID], openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: response,
+					})
+
+					return response, nil
+				}
+
+				// Save assistant response to database
+				if err := a.chatDB.SaveMessage(chatID, "assistant", response); err != nil {
+					log.Printf("Warning: failed to save assistant message to database: %v", err)
+				}
+
+				// Add to chat history
+				a.chatHistory[chatID] = append(a.chatHistory[chatID], openai.ChatCompletionMessage{
+					Role:    openai.ChatMessageRoleAssistant,
+					Content: response,
+				})
+
+				return response, nil
+			}
+		}
+	}
+
+	// If no tool calls, return the direct response
+	response := message.Content
+
+	// Check if response is empty and handle gracefully
+	if strings.TrimSpace(response) == "" {
+		log.Println("Received empty response from AI, providing fallback message")
+		response = "I apologize, but I wasn't able to generate a response. Please try asking your question again."
+
+		// Save fallback response to database
+		if err := a.chatDB.SaveMessage(chatID, "assistant", response); err != nil {
+			log.Printf("Warning: failed to save fallback assistant message to database: %v", err)
+		}
+
+		// Add to chat history
+		a.chatHistory[chatID] = append(a.chatHistory[chatID], openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleAssistant,
+			Content: response,
+		})
+
+		return response, nil
+	}
+
+	// Save assistant response to database
+	if err := a.chatDB.SaveMessage(chatID, "assistant", response); err != nil {
+		log.Printf("Warning: failed to save assistant message to database: %v", err)
+	}
+
+	// Add to chat history
+	a.chatHistory[chatID] = append(a.chatHistory[chatID], openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleAssistant,
+		Content: response,
+	})
+
+	return response, nil
+}
+
+// Telegram bot setup
+func setupTelegramBot(agent *Agent) error {
+	botToken := os.Getenv("BOT_TOKEN")
+	if botToken == "" {
+		return fmt.Errorf("BOT_TOKEN not set in environment")
+	}
+
+	bot, err := tgbotapi.NewBotAPI(botToken)
+	if err != nil {
+		return err
+	}
+
+	bot.Debug = false
+	log.Printf("Authorized on account %s", bot.Self.UserName)
+
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := bot.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.Message != nil {
+			chatID := update.Message.Chat.ID
+			userMessage := update.Message.Text
+
+			log.Printf("Received message from %d: %s", chatID, userMessage)
+
+			// Process message through agent (chat session is cached internally)
+			response, err := agent.ProcessMessage(chatID, userMessage)
+			if err != nil {
+				log.Printf("Error processing message: %v", err)
+				response = "Sorry, I encountered an error processing your request."
+			}
+
+			// Send response back to Telegram
+			msg := tgbotapi.NewMessage(chatID, response)
+			msg.ParseMode = "Markdown"
+			_, err = bot.Send(msg)
+			if err != nil {
+				log.Printf("Error sending message: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
 
 func main() {
-	if _, err := os.Stat(".env"); err == nil {
-		err := godotenv.Load()
-		if err != nil {
-			log.Fatal("Error loading .env file")
-		}
-	}
-
-	llm.GROQ_API_KEY = os.Getenv("GROQ_API_KEY")
-
-	// Get Canvas API key from environment
-	apiToken := os.Getenv("CANVAS_API_KEY")
-	if apiToken == "" {
-		log.Fatal("CANVAS_API_KEY not found in environment")
-	}
-
-	sendMessage("Server Updated")
-
-	courseIDs, err := fetchCourseIDs(apiToken)
-	if err != nil {
-		log.Fatal("Error fetching course IDs:", err)
-	}
-
-	go startHourlyGradeReminderBot(apiToken)
-
-	// Start reminder bot for each course
-	for _, courseID := range courseIDs {
-		go startDailyReminderBot(apiToken, courseID)
-
-	}
-
-	// Keep main thread alive
-	select {}
-}
-
-func startDailyReminderBot(apiToken string, courseID int) {
-
-	// Run the first check immediately
-	fmt.Println("Starting initial assignment fetch...")
-	assignments, err := fetchAssignments(apiToken, courseID)
-	if err != nil {
-		fmt.Printf("Error fetching assignments: %v\n", err)
-	} else {
-		processAssignments(assignments)
-	}
-	for {
-		now := time.Now()
-		nextRun := time.Date(now.Year(), now.Month(), now.Day(), 8, 0, 0, 0, now.Location())
-		if now.After(nextRun) {
-			nextRun = nextRun.Add(24 * time.Hour)
-		}
-		fmt.Printf("Next run scheduled for: %s\n", nextRun.Format(time.RFC1123))
-		time.Sleep(time.Until(nextRun))
-		assignments, err := fetchAssignments(apiToken, courseID)
-		if err != nil {
-			fmt.Printf("Error fetching assignments: %v\n", err)
-			continue
-		}
-		processAssignments(assignments)
-	}
-}
-
-func startHourlyGradeReminderBot(apiToken string) {
-	// Initialize global score tracker
-	globalScoreTracker := make(map[int]float64)
-
-	for {
-		// Fetch courses
-		courses, err := fetchCourses(apiToken)
-		if err != nil {
-			fmt.Printf("Error fetching courses: %v\n", err)
-			continue
-		}
-
-		// Check if ComputedCurrentScore has changed
-		for _, course := range courses {
-			for _, enrollment := range course.Enrollments {
-				if globalScoreTracker[course.ID] != enrollment.ComputedCurrentScore {
-					fmt.Printf("Course %d score has changed: %f -> %f\n", course.ID, globalScoreTracker[course.ID], enrollment.ComputedCurrentScore)
-					sendMessage("Score change detected for Course: " + course.CourseCode + ". New score: " + strconv.FormatFloat(enrollment.ComputedCurrentScore, 'f', 2, 64))
-					globalScoreTracker[course.ID] = enrollment.ComputedCurrentScore
-				}
-				//print the score anyways along with class name
-				fmt.Printf("Course %d: %s - Score: %f\n", course.ID, course.Name, enrollment.ComputedCurrentScore)
-			}
-		}
-
-		// Sleep for an hour
-		time.Sleep(time.Hour)
-	}
-}
-
-func fetchCourseIDs(apiToken string) ([]int, error) {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", "https://canvas.instructure.com/api/v1/users/self/favorites/courses", nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch courses: %s", resp.Status)
-	}
-
-	var courses []struct {
-		ID int `json:"id"`
-	}
-	// bodyBytes, err := io.ReadAll(resp.Body)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// fmt.Println("Response body:", string(bodyBytes))
-
-	// // Reset the response body for subsequent json.Decode
-	// resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	err = json.NewDecoder(resp.Body).Decode(&courses)
-	if err != nil {
-		return nil, err
-	}
-
-	courseIDs := make([]int, len(courses))
-	for i, course := range courses {
-		courseIDs[i] = course.ID
-	}
-
-	fmt.Println("course ids", courseIDs)
-
-	return courseIDs, nil
-}
-
-// fetch courses function
-func fetchCourses(apiToken string) ([]Course, error) {
-	client := &http.Client{}
-	courses := []Course{}
-
-	// Assuming courseIDs is a global variable or passed as a parameter
-	// If courseIDs is not defined, this function will not work as intended
-	// for i, courseID := range courseIDs {
-	req, err := http.NewRequest("GET", "https://canvas.instructure.com/api/v1/users/self/favorites/courses?include[]=total_scores", nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch course: %s", resp.Status)
-	}
-
-	err = json.NewDecoder(resp.Body).Decode(&courses)
-	if err != nil {
-		return nil, err
-	}
-	return courses, nil
-}
-
-func fetchAssignments(apiToken string, courseID int) ([]Assignment, error) {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://canvas.instructure.com/api/v1/courses/%d/assignments", courseID), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch assignments: %s", resp.Status)
-	}
-
-	var assignments []Assignment
-	err = json.NewDecoder(resp.Body).Decode(&assignments)
-	if err != nil {
-		return nil, err
-	}
-
-	// fmt.Println("Assignments", assignments)
-
-	return assignments, nil
-}
-
-func processAssignments(assignments []Assignment) {
-	now := time.Now()
-	for _, assignment := range assignments {
-		if assignment.DueAt.IsZero() || now.After(assignment.DueAt) {
-			continue
-		}
-
-		timeUntilDue := assignment.DueAt.Sub(now)
-		if timeUntilDue > 0 && timeUntilDue <= 48*time.Hour {
-			if assignment.HasSubmitted {
-				fmt.Printf("Assignment '%s' is already submitted.\n", assignment.Name)
-			} else {
-				scheduleReminder(assignment)
-			}
-		}
-	}
-}
-
-func scheduleReminder(assignment Assignment) {
-	now := time.Now()
-	dueTime := assignment.DueAt
-
-	if _, exists := reminderTracker[assignment.ID]; !exists {
-		reminderTracker[assignment.ID] = make(map[time.Duration]bool)
-	}
-
-	reminderIntervals := []time.Duration{
-		12 * time.Hour,
-		6 * time.Hour,
-		3 * time.Hour,
-		1 * time.Hour,
-	}
-
-	for _, interval := range reminderIntervals {
-		reminderTime := dueTime.Add(-interval)
-		if now.After(reminderTime) || reminderTracker[assignment.ID][interval] {
-			continue
-		}
-
-		go func(reminderTime time.Time, interval time.Duration) {
-			fmt.Printf("Reminder for '%s' scheduled at %s\n", assignment.Name, reminderTime.Format(time.RFC1123))
-			time.Sleep(time.Until(reminderTime))
-			sendNotification(assignment)
-			reminderTracker[assignment.ID][interval] = true
-		}(reminderTime, interval)
-	}
-}
-
-func sendNotification(assignment Assignment) {
-	fmt.Printf("🚨 Reminder: The assignment '%s' is due at %s.\n",
-		assignment.Name, assignment.DueAt.Format(time.RFC1123))
-	//make a prompt that states how many hours until the assignment is due
-	timeUntilDue := assignment.DueAt.Sub(time.Now())
-	hoursUntilDue := timeUntilDue.Hours()
-	htmlUrl := assignment.HTMLURL
-	htmlUrl = strings.Replace(htmlUrl, "canvas", "csus", 1)
-	prompt := fmt.Sprintf("Create a motivating message that will get the user to do his homework, the close it is to the due date, the more urgent the message should be .The assignment '%s' is due in %.1f hours. Here is the link to the assignment: %s", assignment.Name, hoursUntilDue, htmlUrl)
-	message := llm.Ell(createMessage)(prompt)
-	sendMessage(message)
-
-}
-
-func sendMessage(message string) error {
 	// Load environment variables
 	if _, err := os.Stat(".env"); err == nil {
 		err := godotenv.Load()
@@ -309,124 +461,208 @@ func sendMessage(message string) error {
 		}
 	}
 
-	// Retrieve environment variables
-	botToken := os.Getenv("BOT_TOKEN")
-	if botToken == "" {
-		log.Fatal("BOT_TOKEN not set in environment")
-		return fmt.Errorf("BOT_TOKEN not set")
-	}
-	// Define chat IDs
-	chatIDs := []string{"6995936214"}
-	// URL to send the message
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
+	// Parse command line flags
+	cliMode := flag.Bool("cli", false, "Run in CLI mode for testing")
+	listChats := flag.Bool("list-chats", false, "List all chat IDs in the database")
+	chatID := flag.String("chat-id", "", "Specific chat ID to use in CLI mode (if not provided, a new one will be created)")
+	flag.Parse()
 
-	// Iterate over chat IDs and send messages
-	for _, chatID := range chatIDs {
-		// Create the payload
-		payload := map[string]string{
-			"chat_id": chatID,
-			"text":    message,
-		}
-
-		// Convert payload to JSON
-		payloadBytes, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("Failed to marshal payload for chat ID %s: %v", chatID, err)
-			continue
-		}
-
-		// Send the POST request
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(payloadBytes))
-		if err != nil {
-			log.Printf("Failed to send request to chat ID %s: %v", chatID, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		// Check if the message was sent successfully
-		if resp.StatusCode == http.StatusOK {
-			fmt.Printf("Message sent successfully to chat ID %s!\n", chatID)
-		} else {
-			var respBody map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
-				log.Printf("Failed to decode response body for chat ID %s: %v", chatID, err)
-			}
-			//fmt.Printf("Failed to send message to chat ID %s. Status code: %d\n", chatID, resp.StatusCode)
-			//fmt.Println("Response:", respBody)
-		}
-	}
-	return nil
-}
-
-func getAllChatIds() ([]string, error) {
-	if _, err := os.Stat(".env"); err == nil {
-		err := godotenv.Load()
-		if err != nil {
-			log.Fatal("Error loading .env file")
-		}
+	// Get required environment variables
+	openRouterKey := os.Getenv("OPEN_ROUTER_KEY")
+	if openRouterKey == "" {
+		log.Fatal("OPEN_ROUTER_KEY not set in environment")
 	}
 
-	// Retrieve environment variables
-	botToken := os.Getenv("BOT_TOKEN")
-	if botToken == "" {
-		return nil, fmt.Errorf("BOT_TOKEN not set in environment")
+	canvasToken := os.Getenv("CANVAS_API_KEY")
+	if canvasToken == "" {
+		log.Fatal("CANVAS_API_KEY not set in environment")
 	}
 
-	// URL to get updates
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", botToken)
-
-	// Send the GET request
-	resp, err := http.Get(url)
+	// Initialize agent
+	agent, err := NewAgent(openRouterKey, canvasToken)
 	if err != nil {
-		log.Printf("Failed to send request: %v", err)
-		return nil, err
+		log.Fatal("Failed to initialize agent:", err)
 	}
-	defer resp.Body.Close()
+	defer agent.chatDB.Close()
 
-	// Check if the request was successful
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get updates: status code %d", resp.StatusCode)
-	}
+	// Start grade monitoring
+	log.Println("Starting grade monitoring...")
+	gradeMonitor := monitor.NewGradeMonitor(canvasToken, agent.chatDB, monitor.SendTelegramMessage)
+	go gradeMonitor.StartHourlyMonitoring()
 
-	// Parse the response body
-	var respBody map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
-		log.Printf("Failed to decode response body: %v", err)
-		return nil, err
-	}
+	// Start assignment monitoring
+	log.Println("Starting assignment monitoring...")
+	go gradeMonitor.StartDailyAssignmentMonitoring()
 
-	// Extract chat IDs
-	chatIDSet := make(map[string]struct{})
-	result, ok := respBody["result"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response format")
+	// Handle different modes
+	if *listChats {
+		handleListChats(agent.chatDB)
+		return
 	}
 
-	for _, v := range result {
-		message, ok := v.(map[string]interface{})["message"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		chat, ok := message["chat"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		chatID, ok := chat["id"].(float64)
-		if !ok {
-			continue
-		}
-		// Add chat ID to the set to remove duplicates
-		chatIDSet[fmt.Sprintf("%.0f", chatID)] = struct{}{}
-
-	}
-	var chatIds []string
-	for id := range chatIDSet {
-		chatIds = append(chatIds, id)
+	if *cliMode {
+		handleCLIMode(agent, *chatID)
+		return
 	}
 
-	return chatIds, nil
+	// Default: Telegram mode
+	log.Println("Agent initialized successfully!")
+	log.Println("You can now ask me questions about your Canvas courses, assignments, and grades.")
+	log.Println("Examples:")
+	log.Println("- What are my current grades?")
+	log.Println("- What assignments are due soon?")
+	log.Println("- Show me my courses")
+
+	// Start Telegram bot
+	err = setupTelegramBot(agent)
+	if err != nil {
+		log.Fatal("Failed to setup Telegram bot:", err)
+	}
 }
 
-func createMessage(prompt string) string {
-	return prompt
+// handleListChats lists all chat IDs in the database
+func handleListChats(chatDB *database.ChatDB) {
+	chatIDs, err := chatDB.GetAllChatIDs()
+	if err != nil {
+		log.Fatalf("Failed to get chat IDs: %v", err)
+	}
+
+	if len(chatIDs) == 0 {
+		fmt.Println("No chats found in database.")
+		return
+	}
+
+	fmt.Println("Chat IDs in database:")
+	for _, id := range chatIDs {
+		fmt.Printf("- %d\n", id)
+	}
+}
+
+// handleCLIMode handles CLI mode for testing
+func handleCLIMode(agent *Agent, chatIDStr string) {
+	// Determine chat ID
+	var chatID int64
+	if chatIDStr != "" {
+		var err error
+		chatID, err = strconv.ParseInt(chatIDStr, 10, 64)
+		if err != nil {
+			log.Fatalf("Invalid chat ID: %s", chatIDStr)
+		}
+	} else {
+		// Generate a new chat ID for this CLI session
+		chatID = time.Now().UnixNano()
+		fmt.Printf("Using chat ID: %d\n", chatID)
+	}
+
+	log.Println("Agent initialized successfully!")
+	log.Println("Starting CLI mode. Type 'quit' or 'exit' to end the conversation.")
+	log.Println("Type 'help' for available commands.")
+	log.Println("Type 'history' to see conversation history.")
+
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Print("You: ")
+
+	for scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+
+		if input == "" {
+			fmt.Print("You: ")
+			continue
+		}
+
+		// Handle special commands
+		switch strings.ToLower(input) {
+		case "quit", "exit":
+			fmt.Println("Goodbye!")
+			return
+		case "help":
+			fmt.Println("Available commands:")
+			fmt.Println("- quit/exit: End the conversation")
+			fmt.Println("- help: Show this help message")
+			fmt.Println("- history: Show conversation history")
+			fmt.Println("- clear: Clear conversation history")
+			fmt.Println("- new: Start a new conversation")
+			fmt.Println("- Any other text will be sent as a message to the agent")
+			fmt.Print("You: ")
+			continue
+		case "history":
+			showChatHistory(agent.chatDB, chatID)
+			fmt.Print("You: ")
+			continue
+		case "clear":
+			err := agent.chatDB.DeleteChatHistory(chatID)
+			if err != nil {
+				fmt.Printf("Error clearing history: %v\n", err)
+		} else {
+				fmt.Println("Chat history cleared.")
+			}
+			fmt.Print("You: ")
+			continue
+		case "new":
+			// Start a new conversation
+			chatID = time.Now().UnixNano()
+			fmt.Printf("Starting new conversation with chat ID: %d\n", chatID)
+			fmt.Print("You: ")
+			continue
+		}
+
+		// Process message through agent
+		fmt.Println("Thinking...")
+		response, err := agent.ProcessMessage(chatID, input)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+		} else {
+			fmt.Printf("Assistant: %s\n", response)
+		}
+
+		fmt.Print("You: ")
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error reading input: %v", err)
+	}
+}
+
+// showChatHistory displays the conversation history for a chat ID
+func showChatHistory(chatDB *database.ChatDB, chatID int64) {
+	// Get raw messages from database for proper role display
+	rows, err := chatDB.GetDB().Query("SELECT role, content FROM chat_history WHERE chat_id = ? ORDER BY timestamp ASC", chatID)
+	if err != nil {
+		fmt.Printf("Error getting history: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	var messages []struct {
+		Role    string
+		Content string
+	}
+	for rows.Next() {
+		var msg struct {
+			Role    string
+			Content string
+		}
+		if err := rows.Scan(&msg.Role, &msg.Content); err != nil {
+			fmt.Printf("Error reading message: %v\n", err)
+			return
+		}
+		messages = append(messages, msg)
+	}
+
+	if len(messages) == 0 {
+		fmt.Println("No conversation history found.")
+		return
+	}
+
+	fmt.Println("Conversation History:")
+	fmt.Println("====================")
+
+	for _, msg := range messages {
+		role := "Assistant"
+		if msg.Role == "user" {
+			role = "You"
+		}
+		fmt.Printf("%s: %s\n", role, msg.Content)
+	}
+	fmt.Println("====================")
 }
